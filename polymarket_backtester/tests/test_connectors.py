@@ -670,6 +670,519 @@ class TestConnectorIntegration:
 
 
 # ============================================================
+# Point-in-Time Correctness / Look-Ahead Bias Prevention Tests
+# ============================================================
+
+from polymarket_backtester.data.loader import (
+    DataLoader,
+    DataLoaderConfig,
+    SignalRecord,
+    PointInTimeSignalStore
+)
+
+
+class TestSignalRecord:
+    """Tests for SignalRecord dataclass."""
+
+    def test_signal_record_creation(self):
+        """Test creating a signal record."""
+        timestamp = datetime(2024, 1, 15, 10, 0, 0)
+        available_at = datetime(2024, 1, 15, 12, 0, 0)  # 2 hours later
+
+        record = SignalRecord(
+            signal_type="poll",
+            timestamp=timestamp,
+            available_at=available_at,
+            data={"result": 55},
+            source="test_pollster"
+        )
+
+        assert record.signal_type == "poll"
+        assert record.timestamp == timestamp
+        assert record.available_at == available_at
+        assert record.data["result"] == 55
+        assert record.source == "test_pollster"
+
+    def test_signal_record_publication_delay(self):
+        """Test that available_at correctly represents publication delay."""
+        timestamp = datetime(2024, 1, 15, 10, 0, 0)
+        publication_delay = timedelta(hours=2)
+        available_at = timestamp + publication_delay
+
+        record = SignalRecord(
+            signal_type="poll",
+            timestamp=timestamp,
+            available_at=available_at,
+            data={}
+        )
+
+        # The signal was created at 10:00 but only available at 12:00
+        assert (record.available_at - record.timestamp).total_seconds() == 2 * 3600
+
+
+class TestPointInTimeSignalStore:
+    """Tests for the point-in-time signal store."""
+
+    @pytest.fixture
+    def store_with_signals(self):
+        """Create a store with test signals at various times."""
+        store = PointInTimeSignalStore()
+
+        # Create signals with different available_at times
+        # Signal 1: created Jan 1 10:00, available Jan 1 12:00
+        store.add(SignalRecord(
+            signal_type="poll",
+            timestamp=datetime(2024, 1, 1, 10, 0, 0),
+            available_at=datetime(2024, 1, 1, 12, 0, 0),
+            data={"poll_value": 50},
+            source="poll1"
+        ))
+
+        # Signal 2: created Jan 2 10:00, available Jan 2 12:00
+        store.add(SignalRecord(
+            signal_type="poll",
+            timestamp=datetime(2024, 1, 2, 10, 0, 0),
+            available_at=datetime(2024, 1, 2, 12, 0, 0),
+            data={"poll_value": 52},
+            source="poll2"
+        ))
+
+        # Signal 3: created Jan 3 10:00, available Jan 3 12:00
+        store.add(SignalRecord(
+            signal_type="poll",
+            timestamp=datetime(2024, 1, 3, 10, 0, 0),
+            available_at=datetime(2024, 1, 3, 12, 0, 0),
+            data={"poll_value": 54},
+            source="poll3"
+        ))
+
+        # Signal 4: sentiment, created Jan 2 14:00, available Jan 2 15:00
+        store.add(SignalRecord(
+            signal_type="sentiment",
+            timestamp=datetime(2024, 1, 2, 14, 0, 0),
+            available_at=datetime(2024, 1, 2, 15, 0, 0),
+            data={"score": 0.7},
+            source="twitter"
+        ))
+
+        return store
+
+    def test_get_available_at_basic(self, store_with_signals):
+        """Test basic point-in-time query."""
+        store = store_with_signals
+
+        # Query at Jan 2 13:00 - should only see poll1 and poll2
+        # (poll3 available Jan 3, sentiment available Jan 2 15:00)
+        query_time = datetime(2024, 1, 2, 13, 0, 0)
+        signals = store.get_available_at(query_time)
+
+        assert len(signals) == 2
+        sources = [s.source for s in signals]
+        assert "poll1" in sources
+        assert "poll2" in sources
+        assert "poll3" not in sources  # Not yet available
+        assert "twitter" not in sources  # Not yet available
+
+    def test_get_available_at_prevents_look_ahead(self, store_with_signals):
+        """Test that future signals are not accessible (look-ahead prevention)."""
+        store = store_with_signals
+
+        # Query at Jan 1 11:00 - poll1 was created at 10:00 but not available until 12:00
+        query_time = datetime(2024, 1, 1, 11, 0, 0)
+        signals = store.get_available_at(query_time)
+
+        # No signals should be available - the only signal created so far
+        # (poll1 at 10:00) isn't available until 12:00
+        assert len(signals) == 0
+
+    def test_get_available_at_after_publication_delay(self, store_with_signals):
+        """Test signals become available after publication delay."""
+        store = store_with_signals
+
+        # Query at Jan 1 12:01 - poll1 should now be available
+        query_time = datetime(2024, 1, 1, 12, 1, 0)
+        signals = store.get_available_at(query_time)
+
+        assert len(signals) == 1
+        assert signals[0].source == "poll1"
+
+    def test_get_available_at_with_type_filter(self, store_with_signals):
+        """Test filtering by signal type."""
+        store = store_with_signals
+
+        # Query at Jan 3 for polls only
+        query_time = datetime(2024, 1, 3, 16, 0, 0)
+        poll_signals = store.get_available_at(query_time, signal_types=["poll"])
+        sentiment_signals = store.get_available_at(query_time, signal_types=["sentiment"])
+
+        assert len(poll_signals) == 3
+        assert len(sentiment_signals) == 1
+        assert all(s.signal_type == "poll" for s in poll_signals)
+        assert all(s.signal_type == "sentiment" for s in sentiment_signals)
+
+    def test_get_available_at_with_lookback(self, store_with_signals):
+        """Test lookback window filtering."""
+        store = store_with_signals
+
+        # Query at Jan 3 16:00 with 1 day lookback
+        # Should only see signals available since Jan 2 16:00
+        query_time = datetime(2024, 1, 3, 16, 0, 0)
+        signals = store.get_available_at(
+            query_time,
+            signal_types=["poll"],
+            lookback=timedelta(days=1)
+        )
+
+        # Only poll3 (available Jan 3 12:00) falls within lookback
+        assert len(signals) == 1
+        assert signals[0].source == "poll3"
+
+    def test_get_latest_by_type(self, store_with_signals):
+        """Test getting the most recent signal of a type."""
+        store = store_with_signals
+
+        # Query at Jan 3 16:00
+        query_time = datetime(2024, 1, 3, 16, 0, 0)
+
+        latest_poll = store.get_latest_by_type(query_time, "poll")
+        latest_sentiment = store.get_latest_by_type(query_time, "sentiment")
+
+        assert latest_poll is not None
+        assert latest_poll.source == "poll3"
+        assert latest_poll.data["poll_value"] == 54
+
+        assert latest_sentiment is not None
+        assert latest_sentiment.source == "twitter"
+
+    def test_get_latest_by_type_before_any_available(self, store_with_signals):
+        """Test getting latest when no signals are available yet."""
+        store = store_with_signals
+
+        query_time = datetime(2024, 1, 1, 9, 0, 0)  # Before any signals
+        latest = store.get_latest_by_type(query_time, "poll")
+
+        assert latest is None
+
+    def test_binary_search_efficiency(self):
+        """Test that binary search works correctly with many signals."""
+        store = PointInTimeSignalStore()
+
+        # Add 1000 signals, one per hour
+        base_time = datetime(2024, 1, 1, 0, 0, 0)
+        for i in range(1000):
+            timestamp = base_time + timedelta(hours=i)
+            store.add(SignalRecord(
+                signal_type="poll",
+                timestamp=timestamp,
+                available_at=timestamp + timedelta(hours=2),
+                data={"value": i},
+                source=f"source_{i}"
+            ))
+
+        # Query at hour 500 - should have signals 0-498 (500 - 2 hour delay)
+        query_time = base_time + timedelta(hours=500)
+        signals = store.get_available_at(query_time)
+
+        # Signals 0-498 should be available (indices where available_at <= query_time)
+        # Signal i has available_at = base_time + i hours + 2 hours
+        # So available_at <= query_time means i + 2 <= 500, i.e., i <= 498
+        assert len(signals) == 499  # 0 through 498
+
+    def test_add_many_signals(self):
+        """Test adding multiple signals at once."""
+        store = PointInTimeSignalStore()
+
+        signals = [
+            SignalRecord(
+                signal_type="poll",
+                timestamp=datetime(2024, 1, i+1, 10, 0, 0),
+                available_at=datetime(2024, 1, i+1, 12, 0, 0),
+                data={"day": i+1},
+                source=f"day_{i+1}"
+            )
+            for i in range(5)
+        ]
+
+        store.add_many(signals)
+
+        query_time = datetime(2024, 1, 10, 0, 0, 0)
+        result = store.get_available_at(query_time)
+
+        assert len(result) == 5
+
+    def test_clear_store(self):
+        """Test clearing the signal store."""
+        store = PointInTimeSignalStore()
+
+        store.add(SignalRecord(
+            signal_type="poll",
+            timestamp=datetime(2024, 1, 1, 10, 0, 0),
+            available_at=datetime(2024, 1, 1, 12, 0, 0),
+            data={},
+            source="test"
+        ))
+
+        store.clear()
+
+        query_time = datetime(2024, 1, 10, 0, 0, 0)
+        signals = store.get_available_at(query_time)
+
+        assert len(signals) == 0
+
+
+class TestDataLoaderConfig:
+    """Tests for DataLoader configuration."""
+
+    def test_default_config(self):
+        """Test default configuration values."""
+        config = DataLoaderConfig()
+
+        assert config.poll_publication_delay == timedelta(hours=2)
+        assert config.sentiment_publication_delay == timedelta(hours=1)
+        assert config.news_publication_delay == timedelta(minutes=30)
+        assert config.poll_lookback == timedelta(days=14)
+        assert config.sentiment_lookback == timedelta(days=3)
+        assert config.strict_point_in_time is True
+
+    def test_custom_config(self):
+        """Test custom configuration."""
+        config = DataLoaderConfig(
+            poll_publication_delay=timedelta(hours=4),
+            sentiment_publication_delay=timedelta(hours=2),
+            poll_lookback=timedelta(days=7),
+            strict_point_in_time=False
+        )
+
+        assert config.poll_publication_delay == timedelta(hours=4)
+        assert config.sentiment_publication_delay == timedelta(hours=2)
+        assert config.poll_lookback == timedelta(days=7)
+        assert config.strict_point_in_time is False
+
+
+class TestDataLoaderPointInTime:
+    """Tests for DataLoader point-in-time correctness."""
+
+    @pytest.fixture
+    def mock_loader(self):
+        """Create a mock DataLoader."""
+        return DataLoader.create_mock()
+
+    @pytest.mark.asyncio
+    async def test_signal_store_cleared_between_markets(self, mock_loader):
+        """Test that signal store is cleared between market loads."""
+        loader = mock_loader
+        await loader.connect()
+
+        # Access internal signal store
+        assert len(loader._signal_store._signals) == 0
+
+        await loader.disconnect()
+
+    def test_get_signals_for_snapshot_strict_mode(self, mock_loader):
+        """Test that strict point-in-time mode is enforced."""
+        loader = mock_loader
+
+        # Manually add signals to test filtering
+        base_time = datetime(2024, 1, 15, 12, 0, 0)
+
+        # Poll available 2 hours before snapshot
+        loader._signal_store.add(SignalRecord(
+            signal_type="poll",
+            timestamp=base_time - timedelta(hours=4),
+            available_at=base_time - timedelta(hours=2),
+            data={"results": {"Yes": 55, "No": 45}, "type": "average", "averages": {"Yes": 55}},
+            source="early_poll"
+        ))
+
+        # Poll that becomes available AFTER snapshot time (should be excluded)
+        loader._signal_store.add(SignalRecord(
+            signal_type="poll",
+            timestamp=base_time - timedelta(hours=1),
+            available_at=base_time + timedelta(hours=1),  # After snapshot
+            data={"results": {"Yes": 60, "No": 40}, "type": "average", "averages": {"Yes": 60}},
+            source="future_poll"
+        ))
+
+        # Get signals as of snapshot time
+        signals = loader._get_signals_for_snapshot(base_time)
+
+        # Should only see the early poll, not the future one
+        assert "poll_average" in signals
+        # The poll average should be from early_poll (55), not future_poll (60)
+
+    def test_get_signals_non_strict_mode(self):
+        """Test that non-strict mode returns empty (disables filtering)."""
+        config = DataLoaderConfig(strict_point_in_time=False)
+        loader = DataLoader.create_mock(config=config)
+
+        base_time = datetime(2024, 1, 15, 12, 0, 0)
+
+        # Add a signal
+        loader._signal_store.add(SignalRecord(
+            signal_type="poll",
+            timestamp=base_time - timedelta(hours=2),
+            available_at=base_time - timedelta(hours=1),
+            data={"type": "average", "averages": {"Yes": 55}},
+            source="test"
+        ))
+
+        # Non-strict mode should return empty dict (disabled)
+        signals = loader._get_signals_for_snapshot(base_time)
+        assert signals == {}
+
+    def test_data_freshness_metadata(self, mock_loader):
+        """Test that data freshness metadata is included."""
+        loader = mock_loader
+        snapshot_time = datetime(2024, 1, 15, 14, 0, 0)
+
+        # Add poll signal from 6 hours ago (created), available 4 hours ago
+        loader._signal_store.add(SignalRecord(
+            signal_type="poll",
+            timestamp=snapshot_time - timedelta(hours=6),  # Created 6 hours ago
+            available_at=snapshot_time - timedelta(hours=4),  # Available 4 hours ago
+            data={"type": "average", "averages": {"Yes": 55}},
+            source="test"
+        ))
+
+        signals = loader._get_signals_for_snapshot(snapshot_time)
+
+        # Should include freshness metadata
+        assert "_data_timestamp" in signals
+        assert "_data_age_hours" in signals
+        # Data age should be ~6 hours (from timestamp, not available_at)
+        assert signals["_data_age_hours"] == pytest.approx(6.0, abs=0.1)
+
+
+class TestLookAheadBiasScenarios:
+    """
+    Real-world scenarios that could cause look-ahead bias.
+    These tests ensure the system prevents such biases.
+    """
+
+    def test_poll_published_after_market_move(self):
+        """
+        Scenario: A poll is conducted on Jan 1, but results are published Jan 2.
+        A backtest on Jan 1 should NOT use this poll.
+        """
+        store = PointInTimeSignalStore()
+
+        # Poll conducted Jan 1 evening, published Jan 2 morning
+        poll_record = SignalRecord(
+            signal_type="poll",
+            timestamp=datetime(2024, 1, 1, 20, 0, 0),  # Conducted
+            available_at=datetime(2024, 1, 2, 8, 0, 0),  # Published
+            data={"candidate_x": 55},
+            source="major_pollster"
+        )
+        store.add(poll_record)
+
+        # Backtesting at Jan 1 22:00 - poll was conducted 2 hours ago
+        # but won't be published for 10 more hours
+        query_time = datetime(2024, 1, 1, 22, 0, 0)
+        signals = store.get_available_at(query_time)
+
+        # Must NOT see the poll
+        assert len(signals) == 0
+
+    def test_breaking_news_sentiment_delay(self):
+        """
+        Scenario: Breaking news happens at 2pm, sentiment analysis at 3pm.
+        Backtest at 2:30pm should not use the 3pm sentiment.
+        """
+        store = PointInTimeSignalStore()
+
+        store.add(SignalRecord(
+            signal_type="sentiment",
+            timestamp=datetime(2024, 1, 5, 14, 0, 0),  # News breaks
+            available_at=datetime(2024, 1, 5, 15, 0, 0),  # Sentiment processed
+            data={"score": -0.8, "event": "scandal"},
+            source="news_sentiment"
+        ))
+
+        # Query at 2:30pm - news has happened but sentiment not processed
+        query_time = datetime(2024, 1, 5, 14, 30, 0)
+        signals = store.get_available_at(query_time)
+
+        assert len(signals) == 0
+
+    def test_multiple_signal_types_different_delays(self):
+        """
+        Scenario: Polls have 2-hour delay, sentiment has 1-hour delay.
+        Signals created at the same time should be available at different times.
+        """
+        store = PointInTimeSignalStore()
+        base_time = datetime(2024, 1, 10, 10, 0, 0)
+
+        # Poll created at 10am, available at 12pm (2 hour delay)
+        store.add(SignalRecord(
+            signal_type="poll",
+            timestamp=base_time,
+            available_at=base_time + timedelta(hours=2),
+            data={"value": 50},
+            source="poll"
+        ))
+
+        # Sentiment created at 10am, available at 11am (1 hour delay)
+        store.add(SignalRecord(
+            signal_type="sentiment",
+            timestamp=base_time,
+            available_at=base_time + timedelta(hours=1),
+            data={"score": 0.5},
+            source="sentiment"
+        ))
+
+        # Query at 11:30am - sentiment available, poll not
+        query_at_1130 = base_time + timedelta(hours=1, minutes=30)
+        signals_1130 = store.get_available_at(query_at_1130)
+
+        assert len(signals_1130) == 1
+        assert signals_1130[0].signal_type == "sentiment"
+
+        # Query at 12:30pm - both available
+        query_at_1230 = base_time + timedelta(hours=2, minutes=30)
+        signals_1230 = store.get_available_at(query_at_1230)
+
+        assert len(signals_1230) == 2
+
+    def test_stale_data_with_lookback(self):
+        """
+        Scenario: Old polls should not influence current decisions.
+        A 30-day old poll should be excluded with 14-day lookback.
+        """
+        store = PointInTimeSignalStore()
+        current_time = datetime(2024, 2, 1, 12, 0, 0)
+
+        # 30-day old poll
+        store.add(SignalRecord(
+            signal_type="poll",
+            timestamp=current_time - timedelta(days=30),
+            available_at=current_time - timedelta(days=30) + timedelta(hours=2),
+            data={"value": 45},
+            source="old_poll"
+        ))
+
+        # Recent poll
+        store.add(SignalRecord(
+            signal_type="poll",
+            timestamp=current_time - timedelta(days=3),
+            available_at=current_time - timedelta(days=3) + timedelta(hours=2),
+            data={"value": 55},
+            source="recent_poll"
+        ))
+
+        # Query with 14-day lookback
+        signals = store.get_available_at(
+            current_time,
+            signal_types=["poll"],
+            lookback=timedelta(days=14)
+        )
+
+        # Should only see recent poll
+        assert len(signals) == 1
+        assert signals[0].source == "recent_poll"
+
+
+# ============================================================
 # Run Tests
 # ============================================================
 
