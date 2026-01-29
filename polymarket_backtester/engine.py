@@ -3,13 +3,16 @@ Core backtesting engine for Polymarket strategies.
 """
 import uuid
 from datetime import datetime, timedelta
-from typing import Protocol
+from typing import Protocol, Optional, TYPE_CHECKING
 
 from .models import (
     BacktestConfig, BacktestResult, Market, MarketSnapshot, MarketStatus,
     Order, OrderStatus, OrderType, Position, PortfolioState, Side,
     StrategySignal, Trade, PricePoint
 )
+
+if TYPE_CHECKING:
+    from .strategies.llm_auditor import LLMAuditorBase, AuditLogger
 
 
 class Strategy(Protocol):
@@ -39,9 +42,29 @@ class BacktestEngine:
         self.signals: list[StrategySignal] = []
         self.portfolio_history: list[PortfolioState] = []
 
+        # LLM auditor (optional)
+        self.auditor: Optional["LLMAuditorBase"] = None
+        self.audit_logger: Optional["AuditLogger"] = None
+        self.audit_stats = {"approved": 0, "rejected": 0, "modified": 0}
+
     def add_strategy(self, strategy: Strategy) -> None:
         """Register a strategy with the engine."""
         self.strategies.append(strategy)
+
+    def set_auditor(
+        self,
+        auditor: "LLMAuditorBase",
+        logger: Optional["AuditLogger"] = None
+    ) -> None:
+        """
+        Set an LLM auditor to review trades before execution.
+
+        Args:
+            auditor: LLM auditor instance
+            logger: Optional audit logger for tracking decisions
+        """
+        self.auditor = auditor
+        self.audit_logger = logger
 
     def load_market_data(self, market_id: str, snapshots: list[MarketSnapshot]) -> None:
         """Load historical market data for backtesting."""
@@ -349,13 +372,63 @@ class BacktestEngine:
             # Convert signals to orders
             orders = self._aggregate_signals(all_signals)
 
-            # Execute orders
+            # Execute orders (with optional LLM audit)
             snapshot_map = {s.market.id: s for s in snapshots}
             for order in orders:
-                if order.market_id in snapshot_map:
-                    trade = self._execute_order(
-                        order, snapshot_map[order.market_id], current_time
+                if order.market_id not in snapshot_map:
+                    continue
+
+                snapshot = snapshot_map[order.market_id]
+
+                # Find the signal(s) that generated this order
+                order_signals = [s for s in all_signals if s.market_id == order.market_id]
+                primary_signal = order_signals[0] if order_signals else None
+
+                # LLM audit if enabled
+                should_execute = True
+                if self.auditor and primary_signal:
+                    from .strategies.llm_auditor import AuditDecision
+
+                    # Get recent signals for context
+                    recent_signals = self.signals[-20:] if self.signals else []
+
+                    audit_result = self.auditor.audit_trade(
+                        signal=primary_signal,
+                        snapshot=snapshot,
+                        portfolio=self.portfolio,
+                        recent_signals=recent_signals
                     )
+
+                    # Process audit decision
+                    if audit_result.decision == AuditDecision.APPROVE:
+                        should_execute = True
+                        self.audit_stats["approved"] += 1
+                        final_action = "executed"
+                    elif audit_result.decision == AuditDecision.MODIFY:
+                        should_execute = True
+                        self.audit_stats["modified"] += 1
+                        final_action = "modified"
+                        # Apply modifications
+                        if audit_result.suggested_modifications:
+                            new_size = audit_result.suggested_modifications.get("new_size")
+                            if new_size:
+                                order.quantity = self.portfolio.total_value * new_size
+                    elif audit_result.decision == AuditDecision.REJECT:
+                        should_execute = False
+                        self.audit_stats["rejected"] += 1
+                        final_action = "skipped"
+                    else:  # DEFER
+                        should_execute = False
+                        self.audit_stats["rejected"] += 1
+                        final_action = "skipped"
+
+                    # Log audit decision
+                    if self.audit_logger:
+                        self.audit_logger.log(primary_signal, audit_result, final_action)
+
+                # Execute if approved
+                if should_execute:
+                    trade = self._execute_order(order, snapshot, current_time)
                     if trade:
                         self.trades.append(trade)
                         self._update_portfolio(trade)

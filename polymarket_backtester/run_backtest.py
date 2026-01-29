@@ -28,7 +28,9 @@ from .engine import BacktestEngine
 from .strategies import (
     InformationEdgeStrategy,
     MarketInefficiencyStrategy,
-    TimingLiquidityStrategy
+    TimingLiquidityStrategy,
+    MockLLMAuditor,
+    AuditLogger
 )
 from .utils import SyntheticDataGenerator, ReportGenerator
 
@@ -163,6 +165,156 @@ def run_backtest(
         print("Signals by Strategy:")
         for name, perf in result.strategy_performance.items():
             print(f"  - {name}: {perf.get('signals', 0)} signals, avg strength: {perf.get('avg_strength', 0):.3f}")
+
+    return result
+
+
+def run_backtest_with_auditor(
+    scenario_type: str = "election",
+    num_markets: int = 5,
+    num_days: int = 90,
+    initial_capital: float = 10000.0,
+    seed: int = 42,
+    use_real_llm: bool = False,
+    approval_rate: float = 0.7
+) -> None:
+    """
+    Run backtest with LLM auditor reviewing each trade.
+
+    Args:
+        use_real_llm: If True, uses Anthropic API (requires ANTHROPIC_API_KEY).
+                      If False, uses MockLLMAuditor for testing.
+        approval_rate: For mock auditor, base approval probability.
+    """
+    print("=" * 60)
+    print("POLYMARKET BACKTESTER WITH LLM AUDITOR")
+    print("=" * 60)
+    print()
+
+    # Generate data
+    print(f"Generating {scenario_type} scenario...")
+    generator = SyntheticDataGenerator(seed=seed)
+    market_data = generator.generate_scenario(
+        scenario_type=scenario_type,
+        num_markets=num_markets,
+        num_days=num_days,
+        seed=seed
+    )
+
+    # Configure backtest
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=num_days)
+
+    config = BacktestConfig(
+        start_date=start_date,
+        end_date=end_date,
+        initial_capital=initial_capital,
+        max_position_size=0.10,
+        transaction_fee_pct=0.02,
+        slippage_pct=0.005,
+        rebalance_frequency="daily"
+    )
+
+    engine = BacktestEngine(config)
+
+    # Add strategies
+    engine.add_strategy(InformationEdgeStrategy())
+    engine.add_strategy(MarketInefficiencyStrategy())
+    engine.add_strategy(TimingLiquidityStrategy())
+
+    # Configure auditor
+    audit_logger = AuditLogger()
+
+    if use_real_llm:
+        try:
+            from .strategies import AnthropicAuditor
+            auditor = AnthropicAuditor(
+                model="claude-sonnet-4-20250514",
+                max_position_risk=0.12,
+                confidence_threshold=0.6
+            )
+            print("Using Anthropic Claude for trade auditing")
+        except ImportError:
+            print("Anthropic not available, falling back to mock auditor")
+            auditor = MockLLMAuditor(approval_rate=approval_rate)
+    else:
+        auditor = MockLLMAuditor(
+            approval_rate=approval_rate,
+            max_position_risk=0.12,
+            confidence_threshold=0.6
+        )
+        print(f"Using Mock LLM auditor (approval_rate={approval_rate})")
+
+    engine.set_auditor(auditor, audit_logger)
+    print()
+
+    # Load data
+    for market_id, snapshots in market_data.items():
+        engine.load_market_data(market_id, snapshots)
+        if snapshots:
+            print(f"  Loaded: {snapshots[0].market.question[:50]}...")
+
+    print()
+    print("Running backtest with LLM audit on each trade...")
+    print("-" * 40)
+
+    result = engine.run()
+
+    print("-" * 40)
+    print()
+
+    # Report audit statistics
+    print("LLM AUDIT STATISTICS")
+    print("-" * 40)
+    audit_summary = audit_logger.get_summary()
+    print(f"Total audits: {audit_summary.get('total_audits', 0)}")
+    print(f"Approved:     {audit_summary.get('approvals', 0)}")
+    print(f"Modified:     {audit_summary.get('modifications', 0)}")
+    print(f"Rejected:     {audit_summary.get('rejections', 0)}")
+    print(f"Approval rate: {audit_summary.get('approval_rate', 0) * 100:.1f}%")
+    print(f"Execution rate: {audit_summary.get('execution_rate', 0) * 100:.1f}%")
+    print()
+
+    # Engine-level stats
+    print(f"Engine audit stats: {engine.audit_stats}")
+    print()
+
+    # Performance summary
+    print("PERFORMANCE SUMMARY")
+    print("-" * 40)
+    if result.portfolio_history:
+        print(f"Final Value: ${result.portfolio_history[-1].total_value:,.2f}")
+    print(f"Total Return: {result.total_return * 100:.2f}%")
+    print(f"Sharpe Ratio: {result.sharpe_ratio:.3f}")
+    print(f"Max Drawdown: {result.max_drawdown * 100:.2f}%")
+    print(f"Total Trades: {result.total_trades}")
+    print()
+
+    # Compare with non-audited run
+    print("COMPARISON: Running same scenario WITHOUT auditor...")
+    print("-" * 40)
+
+    engine_no_audit = BacktestEngine(config)
+    engine_no_audit.add_strategy(InformationEdgeStrategy())
+    engine_no_audit.add_strategy(MarketInefficiencyStrategy())
+    engine_no_audit.add_strategy(TimingLiquidityStrategy())
+
+    for market_id, snapshots in market_data.items():
+        engine_no_audit.load_market_data(market_id, snapshots)
+
+    result_no_audit = engine_no_audit.run()
+
+    print(f"Without Auditor:")
+    print(f"  Total Return: {result_no_audit.total_return * 100:.2f}%")
+    print(f"  Total Trades: {result_no_audit.total_trades}")
+    print()
+    print(f"With Auditor:")
+    print(f"  Total Return: {result.total_return * 100:.2f}%")
+    print(f"  Total Trades: {result.total_trades}")
+    print()
+
+    trade_reduction = 1 - (result.total_trades / max(result_no_audit.total_trades, 1))
+    print(f"Trade reduction from auditor: {trade_reduction * 100:.1f}%")
 
     return result
 
@@ -317,6 +469,22 @@ def main():
         default=10,
         help="Number of trials for comparison mode"
     )
+    parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Enable LLM auditor for trade validation"
+    )
+    parser.add_argument(
+        "--real-llm",
+        action="store_true",
+        help="Use real Anthropic API instead of mock (requires ANTHROPIC_API_KEY)"
+    )
+    parser.add_argument(
+        "--approval-rate",
+        type=float,
+        default=0.7,
+        help="Approval rate for mock auditor (0.0-1.0)"
+    )
 
     args = parser.parse_args()
 
@@ -325,6 +493,16 @@ def main():
             num_trials=args.trials,
             num_days=args.days,
             initial_capital=args.capital
+        )
+    elif args.audit:
+        run_backtest_with_auditor(
+            scenario_type=args.scenario,
+            num_markets=args.markets,
+            num_days=args.days,
+            initial_capital=args.capital,
+            seed=args.seed,
+            use_real_llm=args.real_llm,
+            approval_rate=args.approval_rate
         )
     else:
         run_backtest(
